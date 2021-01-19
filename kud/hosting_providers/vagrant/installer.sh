@@ -142,6 +142,7 @@ function install_k8s {
     export ANSIBLE_CONFIG=$dest_folder/kubespray-$version/ansible.cfg
     ansible-playbook $verbose -i $kud_inventory $kud_playbooks/preconfigure-kubespray.yml --become --become-user=root | sudo tee $log_folder/setup-kubernetes.log
     ansible-playbook $verbose -i $kud_inventory $dest_folder/kubespray-$version/cluster.yml --become --become-user=root | sudo tee $log_folder/setup-kubernetes.log
+    ansible-playbook $verbose -i $kud_inventory $kud_playbooks/configure-kata.yml --become --become-user=root | sudo tee $log_folder/setup-kata.log
 
     # Configure environment
     mkdir -p $HOME/.kube
@@ -159,14 +160,14 @@ function install_addons {
     ansible-playbook $verbose -i $kud_inventory -e "base_dest=$HOME" $kud_playbooks/configure-kud.yml | sudo tee $log_folder/setup-kud.log
     # The order of KUD_ADDONS is important: some plugins (sriov, qat)
     # require nfd to be enabled.
-    for addon in ${KUD_ADDONS:-topology-manager kata ovn4nfv nfd sriov qat cmk}; do
+    for addon in ${KUD_ADDONS:-topology-manager ovn4nfv nfd sriov qat cmk}; do
         echo "Deploying $addon using configure-$addon.yml playbook.."
         ansible-playbook $verbose -i $kud_inventory -e "base_dest=$HOME" $kud_playbooks/configure-${addon}.yml | sudo tee $log_folder/setup-${addon}.log
     done
     echo "Run the test cases if testing_enabled is set to true."
     if [[ "${testing_enabled}" == "true" ]]; then
         failed_kud_tests=""
-        for addon in ${KUD_ADDONS:-multus topology-manager kata ovn4nfv nfd sriov qat cmk}; do
+        for addon in ${KUD_ADDONS:-multus topology-manager ovn4nfv nfd sriov qat cmk}; do
             pushd $kud_tests
             bash ${addon}.sh || failed_kud_tests="${failed_kud_tests} ${addon}"
             popd

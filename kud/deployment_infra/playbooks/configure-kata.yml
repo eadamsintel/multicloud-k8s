@@ -7,12 +7,17 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 ##############################################################################
-- hosts: localhost
+- hosts: kube-master:kube-node
+  become: yes
+  pre_tasks:
+    - name: Load kud variables
+      include_vars:
+        file: kud-vars.yml
   tasks:
     - name: Apply Kata rbac roles
-      command: "/usr/local/bin/kubectl apply -f {{ playbook_dir }}/../images/kata-rbac.yaml"
+      command: "/usr/local/bin/kubectl apply -f {{ kata_rbac_url }}"
     - name: Apply Kata Deploy
-      command: "/usr/local/bin/kubectl apply -f {{ playbook_dir }}/../images/kata-deploy.yaml"
+      command: "/usr/local/bin/kubectl apply -f {{ kata_deploy_url }}"
     - name: Setup all available Kata Runtimeclasses
-      command: "/usr/local/bin/kubectl apply -f {{ playbook_dir }}/../images/kata-runtimeClasses.yaml"
+      command: "/usr/local/bin/kubectl apply -f {{ kata_runtimeclass_url }}"
 
