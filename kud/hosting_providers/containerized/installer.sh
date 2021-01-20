@@ -11,165 +11,149 @@
 set -o errexit
 set -o nounset
 set -o pipefail
+set -ex
 
 INSTALLER_DIR="$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")"
 
-source ${INSTALLER_DIR}/../../tests/_functions.sh
-
-# _install_go() - Install GoLang package
-function _install_go {
-    version=$(grep "go_version" ${kud_playbooks}/kud-vars.yml | awk -F "'" '{print $2}')
-    local tarball=go$version.linux-amd64.tar.gz
-
-    #gcc is required for go apps compilation
-    if ! which gcc; then
-        sudo apt-get install -y gcc
-    fi
-
-    if $(go version &>/dev/null); then
-        return
-    fi
-
-    wget https://dl.google.com/go/$tarball
-    sudo tar -C /usr/local -xzf $tarball
-    rm $tarball
-
-    export PATH=$PATH:/usr/local/go/bin
-    sudo sed -i "s|^PATH=.*|PATH=\"$PATH\"|" /etc/environment
-}
-
-# _install_pip() - Install Python Package Manager
-function _install_pip {
-    if $(pip --version &>/dev/null); then
-        sudo -E pip install --no-cache-dir --upgrade pip
-    else
-        sudo apt-get install -y python-dev
-        curl -sL https://bootstrap.pypa.io/get-pip.py | sudo python
-    fi
+function install_prerequisites {
+#install package for docker images
+    echo "Removing ppa for jonathonf/python-3.6"
+    ls /etc/apt/sources.list.d/ || true
+    find /etc/apt/sources.list.d -maxdepth 1 -name '*jonathonf*' -delete || true
+    apt-get update
+    apt-get install -y curl vim wget git \
+        software-properties-common python-pip sudo
+    add-apt-repository -y ppa:longsleep/golang-backports
+    apt-get update
+    apt-get install -y golang-go rsync
 }
 
 # _install_ansible() - Install and Configure Ansible program
 function _install_ansible {
-    if $(ansible --version &>/dev/null); then
-        sudo pip uninstall -y ansible
-    fi
-    _install_pip
-    local version=$(grep "ansible_version" ${kud_playbooks}/kud-vars.yml | awk -F ': ' '{print $2}')
-    sudo mkdir -p /etc/ansible/
-    sudo -E pip install --no-cache-dir ansible==$version
+    local version=$(grep "ansible_version" ${kud_playbooks}/kud-vars.yml |
+        awk -F ': ' '{print $2}')
+    mkdir -p /etc/ansible/
+    pip install --no-cache-dir ansible==$version
 }
 
-# _install_docker() - Download and install docker-engine
-function _install_docker {
-    local max_concurrent_downloads=${1:-3}
-
-    if $(docker version &>/dev/null); then
-        return
-    fi
-    sudo apt-get install -y apt-transport-https ca-certificates curl
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-    sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-    sudo apt-get update
-    sudo apt-get install -y docker-ce
-
-    sudo mkdir -p /etc/systemd/system/docker.service.d
-    if [ ${http_proxy:-} ]; then
-        echo "[Service]" | sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf
-        echo "Environment=\"HTTP_PROXY=$http_proxy\"" | sudo tee --append /etc/systemd/system/docker.service.d/http-proxy.conf
-    fi
-    if [ ${https_proxy:-} ]; then
-        echo "[Service]" | sudo tee /etc/systemd/system/docker.service.d/https-proxy.conf
-        echo "Environment=\"HTTPS_PROXY=$https_proxy\"" | sudo tee --append /etc/systemd/system/docker.service.d/https-proxy.conf
-    fi
-    if [ ${no_proxy:-} ]; then
-        echo "[Service]" | sudo tee /etc/systemd/system/docker.service.d/no-proxy.conf
-        echo "Environment=\"NO_PROXY=$no_proxy\"" | sudo tee --append /etc/systemd/system/docker.service.d/no-proxy.conf
-    fi
-    sudo systemctl daemon-reload
-    echo "DOCKER_OPTS=\"-H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock --max-concurrent-downloads $max_concurrent_downloads \"" | sudo tee --append /etc/default/docker
-    if [[ -z $(groups | grep docker) ]]; then
-        sudo usermod -aG docker $USER
-    fi
-
-    sudo systemctl restart docker
-    sleep 10
-}
-
-function _set_environment_file {
-    # By default ovn central interface is the first active network interface on localhost. If other wanted, need to export this variable in aio.sh or Vagrant file.
-    OVN_CENTRAL_INTERFACE="${OVN_CENTRAL_INTERFACE:-$(ip addr show | awk '/inet.*brd/{print $NF; exit}')}"
-    echo "export OVN_CENTRAL_INTERFACE=${OVN_CENTRAL_INTERFACE}" | sudo tee --append /etc/environment
-    echo "export OVN_CENTRAL_ADDRESS=$(get_ovn_central_address)" | sudo tee --append /etc/environment
-    echo "export KUBE_CONFIG_DIR=/opt/kubeconfig" | sudo tee --append /etc/environment
-    echo "export CSAR_DIR=/opt/csar" | sudo tee --append /etc/environment
-    echo "export ANSIBLE_CONFIG=${ANSIBLE_CONFIG}" | sudo tee --append /etc/environment
-}
-
-# install_k8s() - Install Kubernetes using kubespray tool
-function install_k8s {
+function install_kubespray {
     echo "Deploying kubernetes"
-    local dest_folder=/opt
-    version=$(grep "kubespray_version" ${kud_playbooks}/kud-vars.yml | awk -F ': ' '{print $2}')
-    local_release_dir=$(grep "local_release_dir" $kud_inventory_folder/group_vars/k8s-cluster.yml | awk -F "\"" '{print $2}')
+    version=$(grep "kubespray_version" ${kud_playbooks}/kud-vars.yml | \
+        awk -F ': ' '{print $2}')
+    local_release_dir=$(grep "local_release_dir" \
+        $kud_inventory_folder/group_vars/k8s-cluster.yml | \
+        awk -F "\"" '{print $2}')
     local tarball=v$version.tar.gz
-    sudo apt-get install -y sshpass make unzip # install make to run mitogen target and unzip is mitogen playbook dependency
-    sudo apt-get install -y gnupg2 software-properties-common
-    _install_docker
+    # install make to run mitogen target & unzip is mitogen playbook dependency
+    apt-get install -y sshpass make unzip
     _install_ansible
     wget https://github.com/kubernetes-incubator/kubespray/archive/$tarball
-    sudo tar -C $dest_folder -xzf $tarball
-    sudo chown -R $USER $dest_folder/kubespray-$version
-    sudo mkdir -p ${local_release_dir}/containers
+    tar -C $dest_folder -xzf $tarball
+    chown -R root:root $dest_folder/kubespray-$version
+    mkdir -p ${local_release_dir}/containers
     rm $tarball
 
     pushd $dest_folder/kubespray-$version/
-    sudo -E pip install --no-cache-dir -r ./requirements.txt
+    pip install --no-cache-dir -r ./requirements.txt
     make mitogen
     popd
     rm -f $kud_inventory_folder/group_vars/all.yml 2> /dev/null
     if [[ -n "${verbose:-}" ]]; then
-        echo "kube_log_level: 5" | tee $kud_inventory_folder/group_vars/all.yml
+        echo "kube_log_level: 5" | tee \
+            $kud_inventory_folder/group_vars/all.yml
     else
-        echo "kube_log_level: 2" | tee $kud_inventory_folder/group_vars/all.yml
+        echo "kube_log_level: 2" | tee \
+            $kud_inventory_folder/group_vars/all.yml
     fi
-    echo "kubeadm_enabled: true" | tee --append $kud_inventory_folder/group_vars/all.yml
+    echo "kubeadm_enabled: true" | \
+        tee --append $kud_inventory_folder/group_vars/all.yml
     if [[ -n "${http_proxy:-}" ]]; then
-        echo "http_proxy: \"$http_proxy\"" | tee --append $kud_inventory_folder/group_vars/all.yml
+        echo "http_proxy: \"$http_proxy\"" | tee --append \
+            $kud_inventory_folder/group_vars/all.yml
     fi
     if [[ -n "${https_proxy:-}" ]]; then
-        echo "https_proxy: \"$https_proxy\"" | tee --append $kud_inventory_folder/group_vars/all.yml
+        echo "https_proxy: \"$https_proxy\"" | tee --append \
+            $kud_inventory_folder/group_vars/all.yml
     fi
-    export ANSIBLE_CONFIG=$dest_folder/kubespray-$version/ansible.cfg
-    ansible-playbook $verbose -i $kud_inventory $kud_playbooks/preconfigure-kubespray.yml --become --become-user=root | sudo tee $log_folder/setup-kubernetes.log
-    ansible-playbook $verbose -i $kud_inventory $dest_folder/kubespray-$version/cluster.yml --become --become-user=root | sudo tee $log_folder/setup-kubernetes.log
-    ansible-playbook $verbose -i $kud_inventory $kud_playbooks/configure-kata.yml --become --become-user=root | sudo tee $log_folder/setup-kata.log
+}
+
+# install_k8s() - Install Kubernetes using kubespray tool including Kata
+function install_k8s {
+    local cluster_name=$1
+    ansible-playbook $verbose -i \
+        $kud_inventory $kud_playbooks/preconfigure-kubespray.yml \
+        --become --become-user=root | \
+        tee $cluster_log/setup-kubernetes.log
+    ansible-playbook $verbose -i \
+        $kud_inventory $dest_folder/kubespray-$version/cluster.yml \
+        -e cluster_name=$cluster_name --become --become-user=root | \
+        tee $cluster_log/setup-kubernetes.log
+    ansible-playbook $verbose -i \
+        $kud_inventory $kud_playbooks/configure-kata.yml \
+        --become --become-user=root | \
+        tee $cluster_log/setup-kata.log
+
 
     # Configure environment
     mkdir -p $HOME/.kube
     cp $kud_inventory_folder/artifacts/admin.conf $HOME/.kube/config
-    # Copy Kubespray kubectl to be usable in host running Ansible. Requires kubectl_localhost: true in inventory/group_vars/k8s-cluster.yml
-    sudo cp $kud_inventory_folder/artifacts/kubectl /usr/local/bin/
+    # Copy Kubespray kubectl to be usable in host running Ansible.
+    # Requires kubectl_localhost: true in inventory/group_vars/k8s-cluster.yml
+    if !(which kubectl); then
+        cp $kud_inventory_folder/artifacts/kubectl /usr/local/bin/
+    fi
+
+    cp -rf $kud_inventory_folder/artifacts \
+        /opt/kud/multi-cluster/$cluster_name/
 }
 
 # install_addons() - Install Kubenertes AddOns
 function install_addons {
+    if [ ${1:+1} ]; then
+        local plugins_name="$1"
+        echo "additional addons plugins $1"
+    else
+        local plugins_name=""
+        echo "no additional addons pluigns"
+    fi
+
     source /etc/environment
     echo "Installing Kubernetes AddOns"
-    _install_ansible
-    sudo ansible-galaxy install $verbose -r $kud_infra_folder/galaxy-requirements.yml --ignore-errors
-    ansible-playbook $verbose -i $kud_inventory -e "base_dest=$HOME" $kud_playbooks/configure-kud.yml | sudo tee $log_folder/setup-kud.log
+    ansible-galaxy install $verbose -r \
+        $kud_infra_folder/galaxy-requirements.yml --ignore-errors
+
+    ansible-playbook $verbose -i \
+        $kud_inventory -e "base_dest=$HOME" $kud_playbooks/configure-kud.yml | \
+        tee $cluster_log/setup-kud.log
     # The order of KUD_ADDONS is important: some plugins (sriov, qat)
     # require nfd to be enabled.
-    for addon in ${KUD_ADDONS:-topology-manager ovn4nfv nfd sriov qat cmk}; do
+    for addon in ${KUD_ADDONS:-virtlet ovn4nfv nfd sriov qat cmk $plugins_name}; do
         echo "Deploying $addon using configure-$addon.yml playbook.."
-        ansible-playbook $verbose -i $kud_inventory -e "base_dest=$HOME" $kud_playbooks/configure-${addon}.yml | sudo tee $log_folder/setup-${addon}.log
+        ansible-playbook $verbose -i \
+            $kud_inventory -e "base_dest=$HOME" $kud_playbooks/configure-${addon}.yml | \
+            tee $cluster_log/setup-${addon}.log
     done
+
     echo "Run the test cases if testing_enabled is set to true."
     if [[ "${testing_enabled}" == "true" ]]; then
         failed_kud_tests=""
-        for addon in ${KUD_ADDONS:-multus topology-manager ovn4nfv nfd sriov qat cmk}; do
+        for addon in ${KUD_ADDONS:-virtlet ovn4nfv nfd sriov qat cmk $plugins_name}; do
             pushd $kud_tests
             bash ${addon}.sh || failed_kud_tests="${failed_kud_tests} ${addon}"
+            case $addon in
+                "onap4k8s" )
+                    echo "Test the onap4k8s plugin installation"
+                    for functional_test in plugin_edgex plugin_fw plugin_eaa; do
+                        bash ${functional_test}.sh --external || failed_kud_tests="${failed_kud_tests} ${functional_test}"
+                    done
+                    ;;
+                "emco" )
+                    echo "Test the emco plugin installation"
+                    for functional_test in plugin_fw_v2; do
+                        bash ${functional_test}.sh --external || failed_kud_tests="${failed_kud_tests} ${functional_test}"
+                    done
+                    ;;
+            esac
             popd
         done
         if [[ ! -z "$failed_kud_tests" ]]; then
@@ -180,57 +164,27 @@ function install_addons {
     echo "Add-ons deployment complete..."
 }
 
-# install_plugin() - Install ONAP Multicloud Kubernetes plugin
-function install_plugin {
-    echo "Installing multicloud/k8s plugin"
-    _install_go
-    _install_docker
-    sudo -E pip install --no-cache-dir docker-compose
-
-    sudo mkdir -p /opt/{kubeconfig,consul/config}
-    sudo cp $HOME/.kube/config /opt/kubeconfig/kud
-
-    pushd $kud_folder/../../../deployments
-    sudo ./build.sh
-    if [[ "${testing_enabled}" == "true" ]]; then
-        sudo ./start.sh
-        pushd $kud_tests
-        for functional_test in plugin plugin_edgex plugin_fw plugin_eaa; do
-            bash ${functional_test}.sh
-        done
-        popd
-    fi
-    popd
-}
-
 # _print_kubernetes_info() - Prints the login Kubernetes information
 function _print_kubernetes_info {
     if ! $(kubectl version &>/dev/null); then
         return
     fi
+
     # Expose Dashboard using NodePort
     node_port=30080
-    KUBE_EDITOR="sed -i \"s|type\: ClusterIP|type\: NodePort|g\"" kubectl -n kube-system edit service kubernetes-dashboard
-    KUBE_EDITOR="sed -i \"s|nodePort\: .*|nodePort\: $node_port|g\"" kubectl -n kube-system edit service kubernetes-dashboard
+    KUBE_EDITOR="sed -i \"s|type\: ClusterIP|type\: NodePort|g\"" \
+        kubectl -n kube-system edit service kubernetes-dashboard
+    KUBE_EDITOR="sed -i \"s|nodePort\: .*|nodePort\: $node_port|g\"" \
+        kubectl -n kube-system edit service kubernetes-dashboard
 
-    master_ip=$(kubectl cluster-info | grep "Kubernetes master" | awk -F ":" '{print $2}')
+    master_ip=$(kubectl cluster-info | grep "Kubernetes master" | \
+        awk -F ":" '{print $2}')
 
     printf "Kubernetes Info\n===============\n" > $k8s_info_file
     echo "Dashboard URL: https:$master_ip:$node_port" >> $k8s_info_file
     echo "Admin user: kube" >> $k8s_info_file
     echo "Admin password: secret" >> $k8s_info_file
 }
-
-sudo -k # forgot sudo password
-if ! sudo -n "true"; then
-    echo ""
-    echo "passwordless sudo is needed for '$(id -nu)' user."
-    echo "Please fix your /etc/sudoers file. You likely want an"
-    echo "entry like the following one..."
-    echo ""
-    echo "$(id -nu) ALL=(ALL) NOPASSWD: ALL"
-    exit 1
-fi
 
 verbose=""
 if [[ -n "${KUD_DEBUG:-}" ]]; then
@@ -239,32 +193,117 @@ if [[ -n "${KUD_DEBUG:-}" ]]; then
 fi
 
 # Configuration values
-log_folder=/var/log/kud
+dest_folder=/opt
 kud_folder=${INSTALLER_DIR}
 kud_infra_folder=$kud_folder/../../deployment_infra
-export kud_inventory_folder=$kud_folder/inventory
-kud_inventory=$kud_inventory_folder/hosts.ini
 kud_playbooks=$kud_infra_folder/playbooks
 kud_tests=$kud_folder/../../tests
 k8s_info_file=$kud_folder/k8s_info.log
 testing_enabled=${KUD_ENABLE_TESTS:-false}
-sudo mkdir -p $log_folder
-sudo mkdir -p /opt/csar
-sudo chown -R $USER /opt/csar
+
+mkdir -p /opt/csar
+export CSAR_DIR=/opt/csar
+
+function install_pkg {
 # Install dependencies
-# Setup proxy variables
-if [ -f $kud_folder/sources.list ]; then
-    sudo mv /etc/apt/sources.list /etc/apt/sources.list.backup
-    sudo cp $kud_folder/sources.list /etc/apt/sources.list
+    apt-get update
+    install_prerequisites
+    install_kubespray
+}
+
+function install_cluster {
+    version=$(grep "kubespray_version" ${kud_playbooks}/kud-vars.yml | \
+        awk -F ': ' '{print $2}')
+    export ANSIBLE_CONFIG=$dest_folder/kubespray-$version/ansible.cfg
+    install_k8s $1
+    if [ ${2:+1} ]; then
+        echo "install default addons and $2"
+        install_addons "$2"
+    else
+        install_addons
+    fi
+    echo "installed the addons"
+
+    _print_kubernetes_info
+}
+
+function usage {
+    echo "installer usage:"
+    echo "./installer.sh --install_pkg - Install the required softwarepackage"
+    echo "./installer.sh --cluster <cluster name> \
+- Install k8s cluster with default plugins"
+    echo "./installer.sh --cluster <cluster name> \
+--plugins <plugin_1 plugin_2> - Install k8s cluster with default plugins \
+and additional plugins such as onap4k8s."
+}
+
+if [ $# -eq 0 ]; then
+    echo "Error: No arguments supplied"
+    usage
+    exit 1
 fi
-echo "Removing ppa for jonathonf/python-3.6"
-sudo ls /etc/apt/sources.list.d/ || true
-sudo find /etc/apt/sources.list.d -maxdepth 1 -name '*jonathonf*' -delete || true
-sudo apt-get update
-install_k8s
-_set_environment_file
-install_addons
-if ${KUD_PLUGIN_ENABLED:-false}; then
-    install_plugin
+
+if [ -z "$1" ]; then
+    echo "Error: Null argument passed"
+    usage
+    exit 1
 fi
-_print_kubernetes_info
+
+if [ "$1" == "--install_pkg" ]; then
+    export kud_inventory_folder=$kud_folder/inventory
+    kud_inventory=$kud_inventory_folder/hosts.ini
+    install_pkg
+    echo "install pkg"
+    exit 0
+fi
+
+if [ "$1" == "--cluster" ]; then
+    if [ -z "${2-}"  ]; then
+        echo "Error: Cluster name is null"
+        usage
+        exit 1
+    fi
+
+    cluster_name=$2
+    kud_multi_cluster_path=/opt/kud/multi-cluster
+    cluster_path=$kud_multi_cluster_path/$cluster_name
+    echo $cluster_path
+    if [ ! -d "${cluster_path}" ]; then
+        echo "Error: cluster_path ${cluster_path} doesn't exit"
+        usage
+        exit 1
+    fi
+
+    cluster_log=$kud_multi_cluster_path/$cluster_name/log
+    export kud_inventory_folder=$kud_folder/inventory/$cluster_name
+    kud_inventory=$kud_inventory_folder/hosts.ini
+
+    mkdir -p $kud_inventory_folder
+    mkdir -p $cluster_log
+    cp $kud_multi_cluster_path/$cluster_name/hosts.ini $kud_inventory_folder/
+    cp -rf $kud_folder/inventory/group_vars $kud_inventory_folder/
+
+    if [ ${3:+1} ]; then
+        if [ "$3" == "--plugins" ]; then
+            if [ -z "${4-}"  ]; then
+                echo "Error: plugins arguments is null; Refer the usage"
+                usage
+                exit 1
+            fi
+            plugins_name=${@:4:$#}
+            install_cluster $cluster_name "$plugins_name"
+            exit 0
+        else
+            echo "Error: cluster argument should have plugins; \
+                Refer the usage"
+            usage
+            exit 1
+        fi
+    fi
+    install_cluster $cluster_name
+    exit 0
+fi
+
+echo "Error: Refer the installer usage"
+usage
+exit 1
